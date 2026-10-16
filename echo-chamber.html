@@ -1,0 +1,1852 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Echo Chamber</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #05070A; height: 100%; }
+  body { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+  canvas { display: block; background: #05070A; }
+</style>
+</head>
+<body>
+<canvas id="game" width="600" height="500"></canvas>
+<script>
+/* ================= core.js ================= */
+// Echo Chamber — core.js
+// Shared constants/state/level + game loop + input + player + actions.
+// Plain script (no modules). Concatenated BEFORE ai.js, render.js, audio.js.
+// References (never redeclares) Sfx, Tut, and the ai/render functions:
+//   emitNoise, updateCreature, updateRadios, hasLOS, render.
+
+// ---------------------------------------------------------------- C ----
+const C = {
+  TILE: 40, W: 15, H: 11,           // canvas play area 600x440, HUD 60px -> 600x500
+  SONAR_REVEAL_R: 6,                // tiles (Euclidean)
+  SONAR_REVEAL_T: 2.5,              // seconds of visibility
+  SONAR_CD: 4,                      // seconds cooldown
+  SONAR_NOISE_R: 8,                 // noise emitted — larger than reveal
+  P_SPEED: 4.0,                     // tiles/sec normal
+  Q_SPEED: 2.4,                     // tiles/sec quiet (Shift)
+  P_NOISE_R: 3, Q_NOISE_R: 1,       // noise radius per tile entered
+  P_SUSP: 12, Q_SUSP: 4,            // suspicion per step
+  C_ROAM_SPD: 1.8, C_INV_SPD: 3.0, C_HUNT_SPD: 3.85,   // tiles/sec
+  C_TICK_ROAM: 0.55, C_TICK_INV: 0.33, C_TICK_HUNT: 0.26, // seconds per creature step
+  VISION_R: 2,                      // creature vision (Bresenham LOS)
+  CAPTURE_D: 0.6,                   // tiles — capture distance
+  SUSP_MAX: 100, SUSP_DECAY: 8, SUSP_DECAY_HIDDEN: 20, // per second
+  SUSP_INVESTIGATE: 40, SUSP_HUNT: 100, SUSP_DROP: 35, // thresholds
+  PULSE_SUSP: 70, THROW_SUSP: 40, RADIO_SUSP: 25,
+  THROW_N: 3, THROW_RANGE: 5, THROW_NOISE_R: 5,  // Manhattan range, needs LOS
+  RADIO_N: 2, RADIO_TICK_R: 4, RADIO_TICK_T: 2, RADIO_LIFE: 12, // seconds
+  HIDE_T: 1.5,                      // still seconds -> hidden
+  BASE_SIGHT: 2.5,                  // always-on dim awareness radius (tiles)
+  KEYS_NEED: 3,
+};
+
+// ---------------------------------------------------------------- G ----
+const G = {
+  state: 'TITLE',            // TITLE | HOWTO | PLAY | PAUSE | WIN | LOSE
+  grid: [],                  // [y][x]: 0 floor, 1 wall (parsed from LEVEL)
+  player: { x:1, y:1, moving:false, fx:1, fy:1, tx:1, ty:1, prog:0,
+            quiet:false, hidden:false, stillT:0, faceX:1, faceY:0 },
+  creature: { x:6, y:4, cstate:'ROAM', susp:0, tgt:null, path:[],
+              tickT:0, lookT:0, searchT:0, stuckN:0, smashT:0 },
+  keycards: [],              // [{x,y,taken}]
+  exit: { x:13, y:6, open:false },
+  radios: [],                // [{tx,ty,t}] active radios, t counts down
+  throwsLeft: 3, radiosLeft: 2,
+  keys: 0,                   // keycards collected (KEPT across restarts)
+  pulseCd: 0,
+  reveal: null,              // Float32Array(W*H) of reveal timestamps (seconds, G.time)
+  rings: [],                 // visual rings [{x,y,r,maxR,t,dur,kind:'sonar'|'noise',color}]
+  noises: [],                // processed stimulus queue [{tx,ty,susp}]
+  time: 0,                   // seconds since level start (this attempt)
+  totalTime: 0,
+  pulsesUsed: 0, throwsUsed: 0, radiosUsed: 0, timesSpotted: 0,
+  loseReason: '',            // epitaph key for lose screen
+  muted: false,
+  heardFlash: 0,             // HUD "HEARD" flicker timer
+};
+G.reveal = new Float32Array(C.W * C.H);
+
+// ------------------------------------------------------------- LEVEL ---
+const LEVEL = [
+  "###############",
+  "#P.....#...#1.#",
+  "#.#....#..#.#.#",
+  "#.#...........#",
+  "#.....C#......#",
+  "###.#######.###",
+  "#......#.....E#",
+  "#.#.........#.#",
+  "#.#....#....#.#",
+  "#2.....#....3.#",
+  "###############",
+];
+
+// ------------------------------------------------------- input state ---
+var _held = {};       // key code -> true while physically held
+var _dirStack = [];   // held movement keys, in press order (last = active)
+var _audioReady = false;
+
+var _DIR_KEYS = {
+  ArrowUp:    { dx: 0, dy: -1 }, KeyW: { dx: 0, dy: -1 },
+  ArrowDown:  { dx: 0, dy:  1 }, KeyS: { dx: 0, dy:  1 },
+  ArrowLeft:  { dx: -1, dy: 0 }, KeyA: { dx: -1, dy: 0 },
+  ArrowRight: { dx: 1, dy: 0 },  KeyD: { dx: 1, dy: 0 },
+};
+
+function _ensureAudio() {
+  if (!_audioReady) { Sfx.init(); _audioReady = true; }
+}
+
+// ------------------------------------------------------------ helpers --
+function _inBounds(x, y) { return x >= 0 && y >= 0 && x < C.W && y < C.H; }
+function _isFloor(x, y) { return _inBounds(x, y) && G.grid[y][x] === 0; }
+
+// Continuous (interpolated) player position for capture checks / render.
+function _playerPos() {
+  var p = G.player;
+  if (p.moving) {
+    return { x: p.fx + (p.tx - p.fx) * p.prog, y: p.fy + (p.ty - p.fy) * p.prog };
+  }
+  return { x: p.x, y: p.y };
+}
+
+function _updateRings(dt) {
+  var out = [];
+  for (var i = 0; i < G.rings.length; i++) {
+    var r = G.rings[i];
+    r.t += dt;
+    if (r.t < r.dur) out.push(r);
+  }
+  G.rings = out;
+}
+
+// ----------------------------------------------------------- initLevel -
+function initLevel(keepKeys) {
+  var takenBefore = G.keycards.map(function (k) { return k.taken; });
+  var keysBefore = G.keys;
+
+  G.grid = [];
+  G.keycards = [];
+  var px = 1, py = 1, cx = 6, cy = 4, ex = 13, ey = 6;
+  for (var y = 0; y < C.H; y++) {
+    G.grid[y] = [];
+    for (var x = 0; x < C.W; x++) {
+      var ch = LEVEL[y][x];
+      G.grid[y][x] = (ch === '#') ? 1 : 0;
+      if (ch === 'P') { px = x; py = y; }
+      else if (ch === 'C') { cx = x; cy = y; }
+      else if (ch === 'E') { ex = x; ey = y; }
+      else if (ch === '1' || ch === '2' || ch === '3') {
+        G.keycards.push({ x: x, y: y, taken: false });
+      }
+    }
+  }
+  for (var i = 0; i < G.keycards.length; i++) {
+    G.keycards[i].taken = (keepKeys && takenBefore[i]) ? true : false;
+  }
+
+  var p = G.player;
+  p.x = px; p.y = py; p.moving = false;
+  p.fx = px; p.fy = py; p.tx = px; p.ty = py; p.prog = 0;
+  p.quiet = false; p.hidden = false; p.stillT = 0;
+  p.faceX = 1; p.faceY = 0;
+
+  var c = G.creature;
+  c.x = cx; c.y = cy; c.cstate = 'ROAM'; c.susp = 0; c.tgt = null; c.path = [];
+  c.tickT = 0; c.lookT = 0; c.searchT = 0; c.stuckN = 0; c.smashT = 0;
+
+  G.exit.x = ex; G.exit.y = ey; G.exit.open = false;
+
+  G.radios = [];
+  G.throwsLeft = C.THROW_N;
+  G.radiosLeft = C.RADIO_N;
+  G.keys = keepKeys ? keysBefore : 0;
+  if (keepKeys && G.keys >= C.KEYS_NEED) G.exit.open = true; // kept 3/3: exit stays open
+  G.pulseCd = 0;
+  G.reveal = new Float32Array(C.W * C.H);
+  G.rings = [];
+  G.noises = [];
+  G.time = 0;
+  G.totalTime = 0;
+  G.pulsesUsed = 0; G.throwsUsed = 0; G.radiosUsed = 0; G.timesSpotted = 0;
+  G.loseReason = '';
+  G.heardFlash = 0;
+
+  _dirStack.length = 0;
+  for (var k in _held) _held[k] = false;
+
+  Tut.reset();
+}
+
+// -------------------------------------------------------- updatePlayer -
+function updatePlayer(dt) {
+  var p = G.player;
+  p.quiet = !!(_held['ShiftLeft'] || _held['ShiftRight']);
+
+  var dir = _dirStack.length ? _dirStack[_dirStack.length - 1] : null;
+  var noInput = !dir;
+
+  if (!p.moving) {
+    if (dir) {
+      var nx = p.x + dir.dx, ny = p.y + dir.dy;
+      if (_isFloor(nx, ny)) {
+        p.moving = true;
+        p.fx = p.x; p.fy = p.y;
+        p.tx = nx; p.ty = ny;
+        p.prog = 0;
+        p.faceX = dir.dx; p.faceY = dir.dy;   // facing = last move dir
+        p.stillT = 0;
+      }
+      // bump into wall: still counts as input, so stillT does not grow
+    } else {
+      p.stillT += dt;
+    }
+  }
+
+  if (p.moving) {
+    p.prog += dt * (p.quiet ? C.Q_SPEED : C.P_SPEED);
+    p.stillT = 0;
+    if (p.prog >= 1) {
+      // land
+      p.x = p.tx; p.y = p.ty;
+      p.moving = false;
+      p.prog = 0;
+
+      emitNoise(p.x, p.y,
+        p.quiet ? C.Q_NOISE_R : C.P_NOISE_R,
+        p.quiet ? C.Q_SUSP : C.P_SUSP);
+      Sfx.step(p.quiet);
+
+      // keycard auto-pickup
+      for (var i = 0; i < G.keycards.length; i++) {
+        var kc = G.keycards[i];
+        if (!kc.taken && kc.x === p.x && kc.y === p.y) {
+          kc.taken = true;
+          G.keys++;
+          Sfx.pickup();
+          if (G.keys === C.KEYS_NEED) {
+            G.exit.open = true;
+            Sfx.unlock();
+          }
+          break;
+        }
+      }
+
+      // exit
+      if (p.x === G.exit.x && p.y === G.exit.y && G.exit.open) {
+        G.state = 'WIN';
+        Sfx.win();
+      }
+    }
+  }
+
+  // stillness -> hidden (only when there is no movement input and not moving)
+  if (!p.moving && noInput) {
+    p.hidden = p.stillT >= C.HIDE_T;
+  } else {
+    p.hidden = false;
+    if (noInput) p.stillT += 0; // keep counting only via the branch above
+  }
+}
+
+// ------------------------------------------------------------- doSonar -
+function doSonar() {
+  if (G.state !== 'PLAY' || G.pulseCd > 0) { Sfx.bonk(); return; } // dull click
+  var pp = _playerPos();
+  G.pulseCd = C.SONAR_CD;
+  var R = C.SONAR_REVEAL_R;
+  var x0 = Math.max(0, Math.floor(pp.x - R)), x1 = Math.min(C.W - 1, Math.ceil(pp.x + R));
+  var y0 = Math.max(0, Math.floor(pp.y - R)), y1 = Math.min(C.H - 1, Math.ceil(pp.y + R));
+  for (var y = y0; y <= y1; y++) {
+    for (var x = x0; x <= x1; x++) {
+      var dx = x - pp.x, dy = y - pp.y;
+      if (Math.sqrt(dx * dx + dy * dy) <= R) G.reveal[y * C.W + x] = G.time;
+    }
+  }
+  G.rings.push({ x: pp.x, y: pp.y, r: 0, maxR: R, t: 0, dur: 0.9,
+                 kind: 'sonar', color: '#4de8ff' });
+  emitNoise(pp.x, pp.y, C.SONAR_NOISE_R, C.PULSE_SUSP);
+  G.pulsesUsed++;
+  Sfx.ping();
+}
+
+// ---------------------------------------------------------- throwObject -
+function throwObject(tx, ty) {
+  if (G.state !== 'PLAY') return;
+  var p = G.player;
+  var dx = Math.abs(tx - p.x), dy = Math.abs(ty - p.y);
+  var ok = G.throwsLeft > 0 &&
+           (dx + dy) <= C.THROW_RANGE &&
+           _isFloor(tx, ty) &&
+           hasLOS(p.x, p.y, tx, ty);
+  if (!ok) { Sfx.bonk(); return; }   // invalid: not consumed
+  G.throwsLeft--;
+  G.throwsUsed++;
+  G.rings.push({ x: tx, y: ty, r: 0, maxR: C.THROW_NOISE_R, t: 0, dur: 0.8,
+                 kind: 'noise', color: '#ffd24d' });
+  emitNoise(tx, ty, C.THROW_NOISE_R, C.THROW_SUSP);
+  Sfx.clatter();
+}
+
+function _throwFacing() {
+  var p = G.player;
+  throwObject(p.x + p.faceX * 4, p.y + p.faceY * 4);
+}
+
+// ----------------------------------------------------------- placeRadio -
+function placeRadio() {
+  if (G.state !== 'PLAY') return;
+  if (G.radiosLeft <= 0) { Sfx.bonk(); return; }
+  var p = G.player;
+  G.radios.push({ tx: p.x, ty: p.y, t: C.RADIO_LIFE, tick: 0 });
+  G.radiosLeft--;
+  G.radiosUsed++;
+  Sfx.radioDrop();
+}
+
+// -------------------------------------------------------- checkCapture -
+function checkCapture() {
+  if (G.state !== 'PLAY') return;
+  var pp = _playerPos();
+  var c = G.creature;
+  var dx = pp.x - c.x, dy = pp.y - c.y;
+  if (Math.sqrt(dx * dx + dy * dy) < C.CAPTURE_D) {
+    G.state = 'LOSE';
+    G.loseReason = 'caught';
+    Sfx.capture();
+  }
+}
+
+// --------------------------------------------------------------- input -
+document.addEventListener('keydown', function (e) {
+  _ensureAudio();
+  var code = e.code;
+  if (code === 'Space' || code === 'ArrowUp' || code === 'ArrowDown' ||
+      code === 'ArrowLeft' || code === 'ArrowRight') {
+    e.preventDefault();
+  }
+
+  _held[code] = true;
+  var mv = _DIR_KEYS[code];
+  if (mv) {
+    var dup = false;
+    for (var i = 0; i < _dirStack.length; i++) {
+      if (_dirStack[i].code === code) { dup = true; break; }
+    }
+    if (!dup) _dirStack.push({ code: code, dx: mv.dx, dy: mv.dy });
+    return;
+  }
+
+  if (e.repeat) return; // actions fire once per press
+
+  switch (code) {
+    case 'Space':
+      if (G.state === 'PLAY') doSonar();
+      break;
+    case 'KeyF':
+      _throwFacing();
+      break;
+    case 'KeyQ':
+      _throwFacing();
+      break;
+    case 'KeyE':
+      placeRadio();
+      break;
+    case 'Enter':
+      if (G.state === 'TITLE') { G.state = 'HOWTO'; }
+      else if (G.state === 'HOWTO') { initLevel(false); G.state = 'PLAY'; }
+      else if (G.state === 'WIN') { initLevel(false); G.state = 'PLAY'; }
+      break;
+    case 'Escape':
+      if (G.state === 'PLAY') G.state = 'PAUSE';
+      else if (G.state === 'PAUSE') G.state = 'PLAY';
+      break;
+    case 'KeyR':
+      if (G.state === 'PLAY' || G.state === 'PAUSE' || G.state === 'LOSE') {
+        initLevel(true); G.state = 'PLAY';
+      } else if (G.state === 'WIN') {
+        initLevel(false); G.state = 'PLAY';
+      }
+      break;
+    case 'KeyM':
+      Sfx.toggleMute();
+      break;
+  }
+});
+
+document.addEventListener('keyup', function (e) {
+  var code = e.code;
+  _held[code] = false;
+  for (var i = _dirStack.length - 1; i >= 0; i--) {
+    if (_dirStack[i].code === code) _dirStack.splice(i, 1);
+  }
+});
+
+// Click on canvas -> throw at that tile.
+(function () {
+  var cv = document.getElementById('game') || document.querySelector('canvas');
+  if (!cv) return;
+  cv.addEventListener('click', function (e) {
+    _ensureAudio();
+    if (G.state !== 'PLAY') return;
+    var rect = cv.getBoundingClientRect();
+    var px = (e.clientX - rect.left) / rect.width * (C.W * C.TILE);
+    var py = (e.clientY - rect.top) / rect.height * (C.H * C.TILE + 60);
+    var tx = Math.floor(px / C.TILE), ty = Math.floor(py / C.TILE);
+    if (tx < 0 || ty < 0 || tx >= C.W || ty >= C.H) return; // HUD / outside
+    throwObject(tx, ty);
+  });
+})();
+
+// ------------------------------------------------------------ gameLoop -
+var _last = 0, _acc = 0, _STEP = 1 / 60;
+
+function _playStep(dt) {
+  G.time += dt;
+  if (G.pulseCd > 0) G.pulseCd = Math.max(0, G.pulseCd - dt);
+  if (G.heardFlash > 0) G.heardFlash = Math.max(0, G.heardFlash - dt);
+  updatePlayer(dt);
+  updateRadios(dt);
+  updateCreature(dt);
+  checkCapture();
+  Tut.update(dt);
+  Sfx.frame(dt);
+  _updateRings(dt);
+}
+
+function gameLoop(ts) {
+  requestAnimationFrame(gameLoop);
+  if (!_last) _last = ts;
+  var dt = (ts - _last) / 1000;
+  _last = ts;
+  if (dt > 0.25) dt = 0.25;      // tab-switch clamp
+  _acc += dt;
+  var n = 0;
+  while (_acc >= _STEP && n < 5) {
+    if (G.state === 'PLAY') _playStep(_STEP);
+    _acc -= _STEP;
+    n++;
+  }
+  if (n === 5) _acc = 0;         // spiral-of-death guard
+  render();
+}
+
+requestAnimationFrame(gameLoop);
+
+
+/* ================= ai.js ================= */
+/* Echo Chamber — ai.js
+ * Creature senses + tick-based FSM. Plain script, no modules.
+ * References shared globals C, G, Sfx (declared in core.js / audio.js).
+ * Only function declarations + one small helper group below.
+ */
+
+'use strict';
+
+/* ---------------- pathfinding / sensing ---------------- */
+
+// 4-directional BFS over floor tiles (G.grid[y][x] === 0).
+// Returns array of [x,y] from the first step to the target (inclusive);
+// null if the target is a wall / out of bounds / unreachable.
+function bfsPath(sx, sy, tx, ty) {
+  sx |= 0; sy |= 0; tx |= 0; ty |= 0;
+  var W = C.W, H = C.H;
+  if (tx < 0 || ty < 0 || tx >= W || ty >= H) return null;
+  if (G.grid[ty][tx] !== 0) return null; // target is a wall
+  if (sx === tx && sy === ty) return [];
+  if (sx < 0 || sy < 0 || sx >= W || sy >= H) return null;
+  if (G.grid[sy][sx] !== 0) return null; // start is a wall
+  var prev = new Array(W * H).fill(-1);
+  var start = sy * W + sx, goal = ty * W + tx;
+  prev[start] = start;
+  var q = [start];
+  var dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+  while (q.length > 0) {
+    var cur = q.shift();
+    var cx = cur % W, cy = (cur / W) | 0;
+    if (cur === goal) break;
+    for (var d = 0; d < 4; d++) {
+      var nx = cx + dirs[d][0], ny = cy + dirs[d][1];
+      if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+      if (G.grid[ny][nx] !== 0) continue;
+      var ni = ny * W + nx;
+      if (prev[ni] !== -1) continue;
+      prev[ni] = cur;
+      q.push(ni);
+    }
+  }
+  if (prev[goal] === -1) return null; // unreachable
+  var path = [];
+  var n = goal;
+  while (n !== start) {
+    path.push([n % W, (n / W) | 0]);
+    n = prev[n];
+  }
+  path.reverse();
+  return path;
+}
+
+// Dijkstra flood from (sx,sy): entering an open tile costs 1, a wall costs 2.
+// Returns a 2D array [y][x] of cost; Infinity wherever cost > maxR.
+function noiseFlood(sx, sy, maxR) {
+  sx |= 0; sy |= 0;
+  var W = C.W, H = C.H;
+  var cost = [];
+  for (var y = 0; y < H; y++) cost.push(new Array(W).fill(Infinity));
+  if (sx < 0 || sy < 0 || sx >= W || sy >= H) return cost;
+  cost[sy][sx] = 0;
+  var open = [[0, sx, sy]]; // [cost, x, y]; open list, tiny grid
+  var dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+  while (open.length > 0) {
+    var bi = 0;
+    for (var i = 1; i < open.length; i++) {
+      if (open[i][0] < open[bi][0]) bi = i;
+    }
+    var cur = open.splice(bi, 1)[0];
+    var cc = cur[0], x = cur[1], yy = cur[2];
+    if (cc !== cost[yy][x]) continue; // stale entry
+    if (cc > maxR) continue;
+    for (var d = 0; d < 4; d++) {
+      var nx = x + dirs[d][0], ny = yy + dirs[d][1];
+      if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+      var nc = cc + (G.grid[ny][nx] === 0 ? 1 : 2);
+      if (nc < cost[ny][nx]) {
+        cost[ny][nx] = nc;
+        open.push([nc, nx, ny]);
+      }
+    }
+  }
+  for (var ay = 0; ay < H; ay++) {
+    for (var ax = 0; ax < W; ax++) {
+      if (cost[ay][ax] > maxR) cost[ay][ax] = Infinity;
+    }
+  }
+  return cost;
+}
+
+// Bresenham line between tile centers; false if any wall tile lies
+// strictly between the endpoints (endpoints themselves may be anything).
+function hasLOS(ax, ay, bx, by) {
+  ax |= 0; ay |= 0; bx |= 0; by |= 0;
+  var dx = Math.abs(bx - ax), dy = Math.abs(by - ay);
+  var sx = ax < bx ? 1 : -1, sy = ay < by ? 1 : -1;
+  var err = dx - dy;
+  var x = ax, y = ay;
+  while (!(x === bx && y === by)) {
+    var e2 = 2 * err;
+    if (e2 > -dy) { err -= dy; x += sx; }
+    if (e2 < dx) { err += dx; y += sy; }
+    if (x === bx && y === by) break; // endpoint: don't test it
+    if (y >= 0 && y < C.H && x >= 0 && x < C.W && G.grid[y][x] === 1) return false;
+  }
+  return true;
+}
+
+// Emit a noise event: flood from (tx,ty); if the creature's tile hears it,
+// queue a stimulus and bump suspicion. Always adds a faint visual ring.
+function emitNoise(tx, ty, radius, susp) {
+  tx |= 0; ty |= 0;
+  var flood = noiseFlood(tx, ty, radius);
+  var c = G.creature;
+  var cx = Math.round(c.x), cy = Math.round(c.y);
+  if (cx >= 0 && cy >= 0 && cx < C.W && cy < C.H && flood[cy][cx] <= radius) {
+    G.noises.push({ tx: tx, ty: ty, susp: susp });
+    c.susp = Math.min(C.SUSP_MAX, Math.max(c.susp, susp));
+    // Sonar pulse heard by the creature -> HUD "HEARD" flicker (render reads G.heardFlash)
+    if (radius === C.SONAR_NOISE_R && susp === C.PULSE_SUSP) G.heardFlash = 1.2;
+  }
+  G.rings.push({ x: tx, y: ty, r: 0, maxR: radius, t: 0, dur: 0.6, kind: 'noise' });
+}
+
+/* ---------------- radios ---------------- */
+
+// Each active radio ticks down; every RADIO_TICK_T seconds it emits a noise.
+// t <= 0 -> battery dead, radio removed.
+function updateRadios(dt) {
+  for (var i = G.radios.length - 1; i >= 0; i--) {
+    var r = G.radios[i];
+    r.t -= dt;
+    r.tick += dt;
+    if (r.tick >= C.RADIO_TICK_T) {
+      r.tick = 0;
+      emitNoise(r.tx, r.ty, C.RADIO_TICK_R, C.RADIO_SUSP);
+    }
+    if (r.t <= 0) G.radios.splice(i, 1);
+  }
+}
+
+/* ---------------- creature FSM ---------------- */
+
+// _enterHunt: vision or suspicion-max trigger. Sets suspicion to max so the
+// hunt sticks, re-targets the player, sting + HUD counter on transition.
+function _enterHunt() {
+  var c = G.creature, p = G.player;
+  c.cstate = 'HUNT';
+  c.susp = C.SUSP_MAX;
+  c.tgt = { x: Math.round(p.x), y: Math.round(p.y) };
+  c.path = [];
+  c.tickT = 0;
+  c.lookT = 0;
+  c.smashT = 0;
+  c.stuckN = 0;
+  Sfx.huntSting();
+  G.timesSpotted++;
+}
+
+// _toSearch: give up and wander near the current point for 4s.
+function _toSearch() {
+  var c = G.creature;
+  c.cstate = 'SEARCH';
+  c.searchT = 4;
+  c.path = [];
+  c.lookT = 0;   // wander timer: repick immediately
+  c.tickT = 0;
+  c.smashT = 0;
+  c.stuckN = 0;
+}
+
+// _setPath: try to path to (tx,ty). On failure runs the stuck failsafe:
+// wait 0.5s and retry; after 3 failures give up -> SEARCH.
+function _setPath(tx, ty) {
+  var c = G.creature;
+  var p = bfsPath(Math.round(c.x), Math.round(c.y), tx, ty);
+  if (p === null) {
+    c.stuckN++;
+    c.lookT = 0.5; // stuck wait (lookT doubles as the wait timer outside LOOK/SEARCH)
+    if (c.stuckN >= 3) {
+      c.stuckN = 0;
+      _toSearch();
+    }
+    return false;
+  }
+  c.stuckN = 0;
+  c.path = p;
+  return true;
+}
+
+function _radioIndexAt(x, y) {
+  for (var i = 0; i < G.radios.length; i++) {
+    if (G.radios[i].tx === x && G.radios[i].ty === y) return i;
+  }
+  return -1;
+}
+
+function _removeRadioAt(x, y) {
+  var i = _radioIndexAt(x, y);
+  if (i >= 0) G.radios.splice(i, 1);
+}
+
+function _ri(a, b) {
+  return a + ((Math.random() * (b - a + 1)) | 0);
+}
+
+// ROAM waypoint: 90% from x>=5 (den region), else anywhere on floor.
+function _pickWaypoint() {
+  var c = G.creature;
+  var cx = Math.round(c.x), cy = Math.round(c.y);
+  var east = [], all = [];
+  for (var y = 0; y < C.H; y++) {
+    for (var x = 0; x < C.W; x++) {
+      if (G.grid[y][x] !== 0) continue;
+      if (x === cx && y === cy) continue;
+      all.push([x, y]);
+      if (x >= 5) east.push([x, y]);
+    }
+  }
+  var pool = (Math.random() < 0.9 && east.length > 0) ? east : all;
+  if (pool.length === 0) return;
+  var w = pool[(Math.random() * pool.length) | 0];
+  c.tgt = { x: w[0], y: w[1] };
+  _setPath(w[0], w[1]);
+}
+
+// SEARCH wander: random nearby floor tile, repicked every 2s.
+function _pickWander() {
+  var c = G.creature;
+  c.lookT = 2; // wander timer
+  var cx = Math.round(c.x), cy = Math.round(c.y);
+  for (var t = 0; t < 12; t++) {
+    var x = cx + _ri(-3, 3), y = cy + _ri(-3, 3);
+    if (x < 0 || y < 0 || x >= C.W || y >= C.H) continue;
+    if (G.grid[y][x] !== 0) continue;
+    if (x === cx && y === cy) continue;
+    var p = bfsPath(cx, cy, x, y);
+    if (p !== null && p.length > 0) {
+      c.stuckN = 0;
+      c.path = p;
+      return;
+    }
+  }
+  c.path = [];
+}
+
+// Called right after a step: arrival handling for INVESTIGATE.
+function _afterStep() {
+  var c = G.creature;
+  if (c.cstate === 'INVESTIGATE' && c.tgt && c.path.length === 0) {
+    if (_radioIndexAt(c.tgt.x, c.tgt.y) >= 0) {
+      c.smashT = 1.5; // stand still and smash the radio
+      return;
+    }
+    c.cstate = 'LOOK';
+    c.lookT = 1.2;
+    c.tickT = 0;
+  }
+}
+
+// One movement tick: HUNT re-paths every tick; others step along the path.
+function _tickStep() {
+  var c = G.creature, p = G.player;
+  if (c.cstate === 'HUNT') {
+    if (c.susp < C.SUSP_DROP) {
+      c.tgt = { x: Math.round(p.x), y: Math.round(p.y) }; // last-known
+      _toSearch();
+      return;
+    }
+    _setPath(Math.round(p.x), Math.round(p.y));
+  }
+  // Stuck wait: do nothing while the 0.5s wait timer runs.
+  if (c.cstate !== 'LOOK' && c.cstate !== 'SEARCH' && c.lookT > 0) return;
+  if (c.path.length > 0) {
+    var nxt = c.path.shift();
+    c.x = nxt[0];
+    c.y = nxt[1];
+    _afterStep();
+  } else if (c.cstate === 'ROAM') {
+    _pickWaypoint();
+  }
+}
+
+// Main per-frame creature update (called from gameLoop in PLAY).
+function updateCreature(dt) {
+  var c = G.creature, p = G.player;
+
+  // 1. Consume the stimulus queue: keep the loudest (ties -> latest).
+  var stim = null;
+  for (var i = 0; i < G.noises.length; i++) {
+    var n = G.noises[i];
+    if (stim === null || n.susp >= stim.susp) stim = n;
+  }
+  G.noises.length = 0;
+
+  // 2. Suspicion decay (faster while the player is hidden).
+  var decay = p.hidden ? C.SUSP_DECAY_HIDDEN : C.SUSP_DECAY;
+  c.susp = Math.max(0, c.susp - decay * dt);
+
+  // 3. Vision check: dist <= VISION_R + Bresenham LOS -> instant HUNT.
+  var dx = p.x - c.x, dy = p.y - c.y;
+  var seen = Math.sqrt(dx * dx + dy * dy) <= C.VISION_R &&
+    hasLOS(Math.round(c.x), Math.round(c.y), Math.round(p.x), Math.round(p.y));
+  if (seen) {
+    if (c.cstate !== 'HUNT') _enterHunt();
+  } else if (c.cstate !== 'HUNT' && c.susp >= C.SUSP_HUNT) {
+    _enterHunt();
+  }
+
+  // 4. Hearing -> INVESTIGATE (from ROAM) or re-target (louder stimulus).
+  // A stimulus that is itself loud enough (>= INVESTIGATE) always triggers,
+  // even if this frame's decay shaved suspicion just under the threshold.
+  var heardLoud = stim !== null &&
+    (c.susp >= C.SUSP_INVESTIGATE || stim.susp >= C.SUSP_INVESTIGATE);
+  if (c.cstate === 'ROAM' && heardLoud) {
+    c.cstate = 'INVESTIGATE';
+    c.tgt = { x: stim.tx, y: stim.ty };
+    c.tsusp = stim.susp;
+    c.smashT = 0;
+    c.tickT = 0;
+    _setPath(stim.tx, stim.ty);
+    if (c.path.length === 0) _afterStep(); // stimulus underfoot
+    Sfx.chitter(); // first heard stimulus
+  } else if (c.cstate === 'INVESTIGATE' && stim !== null &&
+             stim.susp > (c.tsusp || 0) && c.smashT <= 0) {
+    c.tgt = { x: stim.tx, y: stim.ty };
+    c.tsusp = stim.susp;
+    c.tickT = 0;
+    _setPath(stim.tx, stim.ty);
+    if (c.path.length === 0) _afterStep();
+  }
+
+  // 5. Generic countdowns (lookT: LOOK pause / SEARCH wander / stuck wait).
+  c.lookT -= dt;
+
+  // 6. Radio smash: stand still for 1.5s, destroy the radio, -> SEARCH.
+  if (c.smashT > 0) {
+    c.smashT -= dt;
+    if (c.smashT <= 0) {
+      if (c.tgt) _removeRadioAt(c.tgt.x, c.tgt.y);
+      _toSearch();
+    }
+    return;
+  }
+
+  // 7. State timers.
+  if (c.cstate === 'LOOK') {
+    if (c.lookT <= 0) _toSearch();
+    return; // LOOK stands still
+  }
+  if (c.cstate === 'SEARCH') {
+    c.searchT -= dt;
+    if (c.searchT <= 0) {
+      c.susp = Math.max(0, c.susp - 30);
+      c.cstate = 'ROAM';
+      c.tgt = null;
+      c.path = [];
+      c.tickT = 0;
+      c.lookT = 0;
+      return;
+    }
+    if (c.lookT <= 0) _pickWander();
+  }
+
+  // 8. Tick accumulator: one tile-step per tick at the state's rate.
+  var interval = c.cstate === 'ROAM' ? C.C_TICK_ROAM :
+                 c.cstate === 'INVESTIGATE' ? C.C_TICK_INV :
+                 c.cstate === 'HUNT' ? C.C_TICK_HUNT :
+                 c.cstate === 'SEARCH' ? C.C_TICK_ROAM : 1e9;
+  c.tickT += dt;
+  if (c.tickT >= interval) {
+    c.tickT = 0;
+    _tickStep();
+  }
+}
+
+
+/* ================= render.js ================= */
+// ============================================================================
+// render.js — ECHO CHAMBER rendering worker
+// Reads C, G, Tut (never mutates G). Plain script, no modules.
+// Main canvas: 600x440 play area + 60px HUD = 600x500.
+// ============================================================================
+
+var PW = 600, PH = 440, HH = 60;      // play width/height, HUD height
+var _cv = null, _cx = null;           // main canvas + 2d context (lazy)
+var _lit = null, _litx = null;        // lit scene offscreen (600x440)
+var _dark = null, _darkx = null;      // fog-of-war mask offscreen (600x440)
+var _vig = null;                      // pre-rendered vignette
+var _grain = null;                    // pre-rendered 128x128 film grain tile
+
+// Module-level UI-only state (never touches G):
+var _screenSeen = '';                 // last G.state seen (transition timers)
+var _screenT0 = 0;                    // wall-clock time current screen began
+var _keysSeen = -1;                   // last G.keys seen (objective fade)
+var _objT0 = 0;                       // wall-clock time of last objective change
+var _titleRings = [];                 // title-screen ambient rings [{t0}]
+var _titleLast = 0;                   // last title ring spawn (wall clock)
+
+// ---------------------------------------------------------------- helpers ---
+
+function _now() { return performance.now() / 1000; }
+
+function _easeOut(p) { p = Math.max(0, Math.min(1, p)); return 1 - Math.pow(1 - p, 3); }
+
+// Lazy one-time setup: bind main canvas, build offscreens.
+function _init() {
+  if (_cx) return;
+  var cv = document.getElementById('game') || document.querySelector('canvas');
+  if (!cv) { cv = document.createElement('canvas'); document.body.appendChild(cv); }
+  if (cv.width !== PW || cv.height !== PH + HH) { cv.width = PW; cv.height = PH + HH; }
+  _cv = cv;
+  _cx = cv.getContext('2d');
+  _lit = document.createElement('canvas'); _lit.width = PW; _lit.height = PH;
+  _litx = _lit.getContext('2d');
+  _dark = document.createElement('canvas'); _dark.width = PW; _dark.height = PH;
+  _darkx = _dark.getContext('2d');
+  _buildVignette();
+  _buildGrain();
+  _titleLast = _now();
+}
+
+function _buildVignette() {
+  _vig = document.createElement('canvas'); _vig.width = PW; _vig.height = PH;
+  var c = _vig.getContext('2d');
+  var g = c.createRadialGradient(PW / 2, PH / 2, 120, PW / 2, PH / 2, 360);
+  g.addColorStop(0, 'rgba(0,0,0,0)');
+  g.addColorStop(0.62, 'rgba(0,0,0,0.28)');
+  g.addColorStop(1, 'rgba(0,0,0,0.88)');
+  c.fillStyle = g; c.fillRect(0, 0, PW, PH);
+}
+
+function _buildGrain() {
+  _grain = document.createElement('canvas'); _grain.width = 128; _grain.height = 128;
+  var c = _grain.getContext('2d');
+  var img = c.createImageData(128, 128), d = img.data, v;
+  for (var i = 0; i < d.length; i += 4) {
+    v = (Math.random() * 255) | 0;
+    d[i] = v; d[i + 1] = v; d[i + 2] = v; d[i + 3] = 255;
+  }
+  c.putImageData(img, 0, 0);
+}
+
+// Manual letter-spaced centered text (offline-safe, no ctx.letterSpacing).
+function _spaced(c, text, cx, y, ls) {
+  var widths = [], total = 0, i, w;
+  c.save(); c.textAlign = 'left';
+  for (i = 0; i < text.length; i++) { w = c.measureText(text[i]).width; widths.push(w); total += w; }
+  total += ls * (text.length - 1);
+  var x = cx - total / 2;
+  for (i = 0; i < text.length; i++) { c.fillText(text[i], x, y); x += widths[i] + ls; }
+  c.restore();
+}
+
+// Same, with tiny deterministic per-character y jitter (distressed typewriter).
+function _spacedJitter(c, text, cx, y, ls) {
+  var widths = [], total = 0, i, w;
+  c.save(); c.textAlign = 'left';
+  for (i = 0; i < text.length; i++) { w = c.measureText(text[i]).width; widths.push(w); total += w; }
+  total += ls * (text.length - 1);
+  var x = cx - total / 2;
+  for (i = 0; i < text.length; i++) {
+    c.fillText(text[i], x, y + ((i * 37) % 5) - 2);
+    x += widths[i] + ls;
+  }
+  c.restore();
+}
+
+function _wrapLines(c, text, maxW) {
+  var words = String(text).split(' '), lines = [], line = '', t, i;
+  for (i = 0; i < words.length; i++) {
+    t = line ? line + ' ' + words[i] : words[i];
+    if (c.measureText(t).width > maxW && line) { lines.push(line); line = words[i]; }
+    else line = t;
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+// Seconds since a tile was stamped in G.reveal (99 = never/unknown).
+function _tileAge(tx, ty) {
+  var x = Math.round(tx), y = Math.round(ty);
+  if (!G.reveal || x < 0 || y < 0 || x >= C.W || y >= C.H) return 99;
+  return G.time - G.reveal[y * C.W + x];
+}
+function _tileRevealed(tx, ty) { return _tileAge(tx, ty) < C.SONAR_REVEAL_T; }
+
+function _playerFx() { var p = G.player; return (typeof p.fx === 'number') ? p.fx : p.x; }
+function _playerFy() { var p = G.player; return (typeof p.fy === 'number') ? p.fy : p.y; }
+function _creatureDist() {
+  return Math.hypot(G.creature.x - _playerFx(), G.creature.y - _playerFy());
+}
+
+// ------------------------------------------------------------- lit scene ---
+
+function _drawKeycard(c, x, y) {
+  c.save(); c.translate(x, y); c.rotate(Math.PI / 4);
+  c.fillStyle = '#F5A524'; c.fillRect(-7, -7, 14, 14);
+  c.restore();
+  // slow amber glint cross (breadcrumb, not beacon)
+  var s = 0.35 + 0.55 * Math.abs(Math.sin(_now() * 2.1 + x * 0.13));
+  c.strokeStyle = 'rgba(245,165,36,' + s.toFixed(2) + ')'; c.lineWidth = 1.5;
+  c.beginPath();
+  c.moveTo(x - 11, y); c.lineTo(x + 11, y);
+  c.moveTo(x, y - 11); c.lineTo(x, y + 11);
+  c.stroke();
+}
+
+function _drawExit(c) {
+  var T = C.TILE, x = G.exit.x * T, y = G.exit.y * T, cx = x + T / 2;
+  c.fillStyle = G.exit.open ? '#1d3a24' : '#3d1410';
+  c.fillRect(x + 9, y + 4, T - 18, T - 8);
+  c.strokeStyle = G.exit.open ? '#3FA34D' : '#C0392B';
+  c.lineWidth = 3; c.strokeRect(x + 9, y + 4, T - 18, T - 8);
+  c.strokeStyle = 'rgba(232,228,216,0.45)'; c.lineWidth = 1;
+  c.strokeRect(x + 4.5, y + 1.5, T - 9, T - 3);
+  c.font = '14px "Courier New", monospace';
+  c.textAlign = 'center'; c.textBaseline = 'top';
+  if (G.exit.open) {
+    c.fillStyle = '#3FA34D';
+    c.fillText('OPEN', cx, y + T + 2);
+  } else {
+    c.fillStyle = '#C0392B';
+    c.fillText('LOCKED ' + G.keys + '/3', cx, y + T + 2);
+  }
+}
+
+function _drawRadioProp(c, x, y) {
+  c.fillStyle = '#7FB069'; c.fillRect(x - 8, y - 6, 16, 12);
+  c.fillStyle = '#0D1117'; c.fillRect(x - 4, y - 2, 8, 4);
+  c.strokeStyle = '#7FB069'; c.lineWidth = 2;
+  c.beginPath(); c.moveTo(x + 8, y - 6); c.lineTo(x + 12, y - 14); c.stroke();
+  c.fillStyle = '#7FB069';
+  c.beginPath(); c.arc(x + 12, y - 15, 2, 0, Math.PI * 2); c.fill();
+}
+
+function _drawRing(c, rg) {
+  if (!rg || !rg.dur || rg.dur <= 0 || !rg.maxR) return;
+  var p = Math.max(0, Math.min(1, rg.t / rg.dur));
+  var R = _easeOut(p) * rg.maxR * C.TILE;
+  if (R <= 0.5) return;
+  var x = (rg.x + 0.5) * C.TILE, y = (rg.y + 0.5) * C.TILE;
+  var a = 1 - p;
+  if (rg.kind === 'sonar') {
+    // soft secondary echo, 0.15s behind the leading edge
+    var p2 = Math.max(0, Math.min(1, (rg.t - 0.15) / rg.dur));
+    if (p2 > 0 && p2 < 1) {
+      var r2 = _easeOut(p2) * rg.maxR * C.TILE;
+      c.strokeStyle = 'rgba(127,212,255,' + (0.35 * (1 - p2)).toFixed(3) + ')';
+      c.lineWidth = Math.max(1, 3 * (1 - p2) + 1);
+      c.beginPath(); c.arc(x, y, r2, 0, Math.PI * 2); c.stroke();
+    }
+    // cyan glow underlay
+    c.strokeStyle = 'rgba(127,212,255,' + (0.45 * a).toFixed(3) + ')';
+    c.lineWidth = (6 * (1 - p) + 1) * 2.2;
+    c.beginPath(); c.arc(x, y, R, 0, Math.PI * 2); c.stroke();
+    // white-cyan core
+    c.strokeStyle = 'rgba(234,247,255,' + a.toFixed(3) + ')';
+    c.lineWidth = Math.max(1, 6 * (1 - p) + 1);
+    c.beginPath(); c.arc(x, y, R, 0, Math.PI * 2); c.stroke();
+    // faint lingering after-ring at max radius
+    c.strokeStyle = 'rgba(191,239,255,' + (0.16 * a).toFixed(3) + ')';
+    c.lineWidth = 1;
+    c.beginPath(); c.arc(x, y, rg.maxR * C.TILE, 0, Math.PI * 2); c.stroke();
+  } else {
+    // noise ring: thinner, dimmer
+    c.strokeStyle = 'rgba(191,239,255,' + (0.38 * a).toFixed(3) + ')';
+    c.lineWidth = Math.max(1, 2 * (1 - p) + 0.5);
+    c.beginPath(); c.arc(x, y, R, 0, Math.PI * 2); c.stroke();
+  }
+}
+
+function _drawPlayer(c) {
+  var p = G.player;
+  var x = (_playerFx() + 0.5) * C.TILE, y = (_playerFy() + 0.5) * C.TILE;
+  c.fillStyle = '#E8E4D8';
+  c.beginPath(); c.arc(x, y, 12, 0, Math.PI * 2); c.fill();
+  var dx = p.faceX || 1, dy = p.faceY || 0, m = Math.hypot(dx, dy) || 1;
+  dx /= m; dy /= m;
+  c.strokeStyle = '#0D1117'; c.lineWidth = 4; c.lineCap = 'round';
+  c.beginPath(); c.moveTo(x + dx * 7, y + dy * 7); c.lineTo(x + dx * 17, y + dy * 17); c.stroke();
+  c.strokeStyle = '#E8E4D8'; c.lineWidth = 2;
+  c.beginPath(); c.moveTo(x + dx * 7, y + dy * 7); c.lineTo(x + dx * 17, y + dy * 17); c.stroke();
+  if (p.quiet) {
+    c.strokeStyle = 'rgba(232,228,216,0.28)'; c.lineWidth = 1.5;
+    c.setLineDash([4, 4]);
+    c.beginPath(); c.arc(x, y, 19, 0, Math.PI * 2); c.stroke();
+    c.setLineDash([]);
+  }
+}
+
+function _drawCreatureLit(c) {
+  var cr = G.creature;
+  var rev = _tileRevealed(cr.x, cr.y);
+  var near = _creatureDist() <= 2;
+  if (!rev && !near) return;                       // Darkwood rule: unseen = vanished
+  var x = (cr.x + 0.5) * C.TILE, y = (cr.y + 0.5) * C.TILE;
+  if (rev) {
+    // near-black humanoid silhouette — a hole in the light, taller than player
+    c.fillStyle = '#05070A';
+    c.strokeStyle = '#05070A'; c.lineCap = 'round';
+    c.lineWidth = 5;
+    c.beginPath();                                   // arms (too long, angled wrong)
+    c.moveTo(x - 7, y - 10); c.lineTo(x - 15, y + 7);
+    c.moveTo(x + 7, y - 10); c.lineTo(x + 15, y + 7);
+    c.stroke();
+    c.beginPath();                                   // legs
+    c.moveTo(x - 4, y + 6); c.lineTo(x - 6, y + 21);
+    c.moveTo(x + 4, y + 6); c.lineTo(x + 6, y + 21);
+    c.stroke();
+    c.beginPath(); c.ellipse(x, y - 3, 9, 13, 0, 0, Math.PI * 2); c.fill();  // torso
+    c.beginPath(); c.arc(x, y - 21, 7, 0, Math.PI * 2); c.fill();            // head
+    c.strokeStyle = 'rgba(232,228,216,0.14)'; c.lineWidth = 1;
+    c.beginPath(); c.arc(x, y - 21, 7, 0, Math.PI * 2); c.stroke();
+  }
+  // ember eyes — shown if revealed, or within 2 tiles even in pitch dark
+  var ea = near ? 1 : Math.max(0.2, 1 - _tileAge(cr.x, cr.y) / C.SONAR_REVEAL_T);
+  var ex1 = x - 3.5, ex2 = x + 3.5, ey = y - 22;
+  c.fillStyle = 'rgba(255,42,26,' + (0.30 * ea).toFixed(3) + ')';
+  c.beginPath(); c.arc(ex1, ey, 6, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(ex2, ey, 6, 0, Math.PI * 2); c.fill();
+  c.fillStyle = 'rgba(255,42,26,' + ea.toFixed(3) + ')';
+  c.beginPath(); c.arc(ex1, ey, 3, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(ex2, ey, 3, 0, Math.PI * 2); c.fill();
+}
+
+function _drawLit(c) {
+  var T = C.TILE, W = C.W, H = C.H, x, y, i;
+  // floor: near-black slate
+  c.fillStyle = '#0D1117';
+  c.fillRect(0, 0, PW, PH);
+  // faint tile grid (readable only when revealed — fog covers the rest)
+  c.strokeStyle = 'rgba(150,180,210,0.055)'; c.lineWidth = 1;
+  c.beginPath();
+  for (x = 1; x < W; x++) { c.moveTo(x * T + 0.5, 0); c.lineTo(x * T + 0.5, PH); }
+  for (y = 1; y < H; y++) { c.moveTo(0, y * T + 0.5); c.lineTo(PW, y * T + 0.5); }
+  c.stroke();
+  // walls: pale outlines + faint fill
+  if (G.grid && G.grid.length === H) {
+    for (y = 0; y < H; y++) for (x = 0; x < W; x++) {
+      if (G.grid[y][x] === 1) {
+        c.fillStyle = 'rgba(191,239,255,0.07)';
+        c.fillRect(x * T + 1, y * T + 1, T - 2, T - 2);
+        c.strokeStyle = 'rgba(191,239,255,0.85)'; c.lineWidth = 2;
+        c.strokeRect(x * T + 1.5, y * T + 1.5, T - 3, T - 3);
+      }
+    }
+  }
+  for (i = 0; i < G.keycards.length; i++) {
+    var k = G.keycards[i];
+    if (!k.taken) _drawKeycard(c, (k.x + 0.5) * T, (k.y + 0.5) * T);
+  }
+  _drawExit(c);
+  for (i = 0; i < G.radios.length; i++) {
+    var r = G.radios[i];
+    _drawRadioProp(c, (r.tx + 0.5) * T, (r.ty + 0.5) * T);
+  }
+  for (i = 0; i < G.rings.length; i++) _drawRing(c, G.rings[i]);
+  _drawCreatureLit(c);
+  _drawPlayer(c);
+}
+
+// ---------------------------------------------------------- fog-of-war ---
+
+function _hole(c, x, y, r, a) {
+  if (a <= 0.01 || r <= 0) return;
+  var g = c.createRadialGradient(x, y, 0, x, y, r);
+  g.addColorStop(0, 'rgba(0,0,0,' + a.toFixed(3) + ')');
+  g.addColorStop(0.65, 'rgba(0,0,0,' + (a * 0.45).toFixed(3) + ')');
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = g;
+  c.beginPath(); c.arc(x, y, r, 0, Math.PI * 2); c.fill();
+}
+
+function _drawDark() {
+  var c = _darkx, T = C.TILE, x, y;
+  c.globalCompositeOperation = 'source-over';
+  c.clearRect(0, 0, PW, PH);
+  c.fillStyle = '#000';
+  c.fillRect(0, 0, PW, PH);
+  c.globalCompositeOperation = 'destination-out';
+  // (a) permanent soft hole at player: r=1.2 tiles, leaves ~85% black
+  _hole(c, (_playerFx() + 0.5) * T, (_playerFy() + 0.5) * T, 1.2 * T, 0.15);
+  // (b) holes for tiles revealed in the last 2.5s, fading with age
+  if (G.reveal) {
+    for (y = 0; y < C.H; y++) for (x = 0; x < C.W; x++) {
+      var age = G.time - G.reveal[y * C.W + x];
+      if (age >= 0 && age < C.SONAR_REVEAL_T) {
+        var f = 1 - age / C.SONAR_REVEAL_T;
+        _hole(c, (x + 0.5) * T, (y + 0.5) * T, T * 0.8, Math.pow(f, 1.15));
+      }
+    }
+  }
+  // eyes peephole: let the ember eyes show through even in darkness
+  var cr = G.creature;
+  if (_tileRevealed(cr.x, cr.y) || _creatureDist() <= 2) {
+    _hole(c, (cr.x + 0.5) * T, (cr.y + 0.5) * T, 22, 0.55);
+  }
+  c.globalCompositeOperation = 'source-over';
+}
+
+function _drawGrain(c) {
+  var ox = -((Math.random() * 128) | 0), oy = -((Math.random() * 128) | 0);
+  var x, y;
+  c.save(); c.globalAlpha = 0.05;
+  for (x = ox; x < PW; x += 128) for (y = oy; y < PH; y += 128) c.drawImage(_grain, x, y);
+  c.restore();
+}
+
+// ------------------------------------------------- proximity feedback ---
+
+function _drawProximity(c) {
+  var d = _creatureDist();
+  // red edge vignette: alpha = clamp(1 - dist/12) * 0.35, slow 0.8 Hz sine throb
+  var base = Math.max(0, Math.min(1, 1 - d / 12)) * 0.35;
+  if (base > 0.004) {
+    var th = 0.7 + 0.3 * Math.sin(G.time * Math.PI * 2 * 0.8);
+    var g = c.createRadialGradient(PW / 2, PH / 2, 140, PW / 2, PH / 2, 360);
+    g.addColorStop(0, 'rgba(192,57,43,0)');
+    g.addColorStop(1, 'rgba(192,57,43,' + (base * th).toFixed(3) + ')');
+    c.fillStyle = g; c.fillRect(0, 0, PW, PH);
+  }
+  var psx = (_playerFx() + 0.5) * C.TILE, psy = (_playerFy() + 0.5) * C.TILE;
+  if (d <= 3 && d > 0.05 && G.state === 'PLAY') {
+    // faint directional chevrons at the screen edge, pointing at the creature
+    var csx = (G.creature.x + 0.5) * C.TILE, csy = (G.creature.y + 0.5) * C.TILE;
+    var ang = Math.atan2(csy - psy, csx - psx);
+    var ex = PW / 2 + Math.cos(ang) * 262, ey = PH / 2 + Math.sin(ang) * 182;
+    ex = Math.max(30, Math.min(PW - 30, ex));
+    ey = Math.max(30, Math.min(PH - 30, ey));
+    var ca = 0.26 + 0.12 * Math.sin(G.time * Math.PI * 2 * 0.8);
+    var dx = Math.cos(ang), dy = Math.sin(ang);
+    var px = -dy, py = dx, i, bx, by;
+    c.strokeStyle = 'rgba(192,57,43,' + ca.toFixed(3) + ')';
+    c.lineWidth = 3; c.lineCap = 'round';
+    for (i = 0; i < 2; i++) {
+      bx = ex - dx * i * 17; by = ey - dy * i * 17;
+      c.beginPath();
+      c.moveTo(bx - dx * 7 - px * 7, by - dy * 7 - py * 7);
+      c.lineTo(bx, by);
+      c.lineTo(bx - dx * 7 + px * 7, by - dy * 7 + py * 7);
+      c.stroke();
+    }
+  }
+  if (G.keys >= C.KEYS_NEED && G.state === 'PLAY') {
+    // faint amber edge arrow guiding toward the exit
+    var ang2 = Math.atan2((G.exit.y + 0.5) * C.TILE - psy, (G.exit.x + 0.5) * C.TILE - psx);
+    var ax = PW / 2 + Math.cos(ang2) * 262, ay = PH / 2 + Math.sin(ang2) * 182;
+    ax = Math.max(34, Math.min(PW - 34, ax));
+    ay = Math.max(34, Math.min(PH - 34, ay));
+    var aa = 0.40 + 0.20 * Math.sin(G.time * Math.PI * 2 * 0.5);
+    var d2x = Math.cos(ang2), d2y = Math.sin(ang2);
+    c.fillStyle = 'rgba(245,165,36,' + aa.toFixed(3) + ')';
+    c.beginPath();
+    c.moveTo(ax + d2x * 10, ay + d2y * 10);
+    c.lineTo(ax - d2x * 6 - d2y * 7, ay - d2y * 6 + d2x * 7);
+    c.lineTo(ax - d2x * 6 + d2y * 7, ay - d2y * 6 - d2x * 7);
+    c.closePath(); c.fill();
+  }
+}
+
+// ------------------------------------------------------------------ HUD ---
+
+function _drawHUD(c) {
+  var i;
+  c.fillStyle = '#05070A'; c.fillRect(0, PH, PW, HH);
+  c.fillStyle = '#232c38'; c.fillRect(0, PH, PW, 1);
+  c.textBaseline = 'middle';
+
+  // keycard slots: diamond outlines, filled amber when taken
+  for (i = 0; i < C.KEYS_NEED; i++) {
+    var kx = 30 + i * 30, ky = PH + 30;
+    c.save(); c.translate(kx, ky); c.rotate(Math.PI / 4);
+    if (i < G.keys) { c.fillStyle = '#F5A524'; c.fillRect(-7, -7, 14, 14); }
+    c.strokeStyle = i < G.keys ? '#F5A524' : 'rgba(232,228,216,0.55)';
+    c.lineWidth = 2; c.strokeRect(-7, -7, 14, 14);
+    c.restore();
+  }
+
+  // objective text: full alpha for 6s after a change, then fades to 40%
+  var now = _now();
+  if (_keysSeen !== G.keys) { _keysSeen = G.keys; _objT0 = now; }
+  c.globalAlpha = (now - _objT0 > 6) ? 0.4 : 1;
+  c.font = '15px "Courier New", monospace';
+  c.textAlign = 'left'; c.fillStyle = '#E8E4D8';
+  c.fillText(G.keys >= C.KEYS_NEED ? 'REACH THE EXIT \u2192' : 'FIND KEYCARDS ' + G.keys + '/3',
+             118, PH + 31);
+  c.globalAlpha = 1;
+
+  // throw distraction icon (rock: ringed circle + specks) + count
+  var tx0 = 428, ty0 = PH + 30;
+  c.globalAlpha = G.throwsLeft > 0 ? 1 : 0.28;
+  c.strokeStyle = 'rgba(232,228,216,0.75)'; c.lineWidth = 2;
+  c.beginPath(); c.arc(tx0, ty0, 7, 0, Math.PI * 2); c.stroke();
+  c.fillStyle = 'rgba(232,228,216,0.75)';
+  c.beginPath(); c.arc(tx0 - 2, ty0 - 1, 1.6, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(tx0 + 2, ty0 + 2, 1.6, 0, Math.PI * 2); c.fill();
+  c.font = '14px "Courier New", monospace'; c.textAlign = 'left'; c.fillStyle = '#E8E4D8';
+  c.fillText('\u00D7' + G.throwsLeft, tx0 + 12, ty0 + 1);
+  c.globalAlpha = 1;
+
+  // radio distraction icon (square + antenna) + count
+  var rx0 = 494;
+  c.globalAlpha = G.radiosLeft > 0 ? 1 : 0.28;
+  c.strokeStyle = '#7FB069'; c.lineWidth = 2;
+  c.strokeRect(rx0 - 7, ty0 - 6, 14, 12);
+  c.beginPath(); c.moveTo(rx0 + 7, ty0 - 6); c.lineTo(rx0 + 11, ty0 - 13); c.stroke();
+  c.fillStyle = '#E8E4D8'; c.font = '14px "Courier New", monospace'; c.textAlign = 'left';
+  c.fillText('\u00D7' + G.radiosLeft, rx0 + 15, ty0 + 1);
+  c.globalAlpha = 1;
+
+  // sonar cooldown: radial sweep icon
+  var sx = 562, sy = PH + 30;
+  c.strokeStyle = 'rgba(232,228,216,0.35)'; c.lineWidth = 2;
+  c.beginPath(); c.arc(sx, sy, 13, 0, Math.PI * 2); c.stroke();
+  if (G.pulseCd > 0) {
+    var frac = 1 - G.pulseCd / C.SONAR_CD;
+    frac = Math.max(0, Math.min(1, frac));
+    c.strokeStyle = '#BFEFFF'; c.lineWidth = 4;
+    c.beginPath(); c.arc(sx, sy, 13, -Math.PI / 2, -Math.PI / 2 + frac * Math.PI * 2); c.stroke();
+  } else {
+    c.fillStyle = '#F5A524';
+    c.beginPath(); c.arc(sx, sy, 4, 0, Math.PI * 2); c.fill();
+    var rp = 0.5 + 0.5 * Math.sin(now * 3);   // slow ready shimmer, never a blink
+    c.strokeStyle = 'rgba(245,165,36,' + (0.22 + 0.20 * rp).toFixed(2) + ')';
+    c.lineWidth = 1.5;
+    c.beginPath(); c.arc(sx, sy, 16.5, 0, Math.PI * 2); c.stroke();
+  }
+
+  // red "HEARD" while the pulse reached the creature — smooth swell, no strobe
+  if (G.heardFlash > 0) {
+    var ha = 0.65 + 0.35 * Math.sin(G.time * 9);
+    c.globalAlpha = Math.max(0.35, ha);
+    c.font = 'bold 14px "Courier New", monospace';
+    c.textAlign = 'center'; c.fillStyle = '#C0392B';
+    c.fillText('HEARD', sx, PH - 14);
+    c.globalAlpha = 1;
+  }
+}
+
+// 4-band dread meter on the play area's right edge (bands, not digits).
+function _drawDread(c) {
+  var d = _creatureDist();
+  var close = Math.max(0, Math.min(1, 1 - d / 12));
+  var lit = Math.round(close * 4);
+  var cols = ['#2A3138', '#F5A524', '#C0392B', '#FF2A1A'];
+  for (var i = 0; i < 4; i++) {
+    var bx = PW - 16, by = 150 - i * 34, bw = 10, bh = 28;
+    if (i < lit) { c.fillStyle = cols[i]; c.fillRect(bx, by, bw, bh); }
+    else {
+      c.strokeStyle = 'rgba(232,228,216,0.18)'; c.lineWidth = 1;
+      c.strokeRect(bx + 0.5, by + 0.5, bw - 1, bh - 1);
+    }
+  }
+}
+
+function _drawTutorial(c) {
+  var t = null;
+  try { t = Tut.text(); } catch (e) { t = null; }
+  if (!t) return;
+  c.font = '16px "Courier New", monospace';
+  c.textAlign = 'center'; c.textBaseline = 'middle';
+  var w = c.measureText(t).width;
+  c.fillStyle = 'rgba(5,7,10,0.72)';
+  c.fillRect(300 - w / 2 - 12, PH - 58, w + 24, 30);
+  c.strokeStyle = 'rgba(191,239,255,0.25)'; c.lineWidth = 1;
+  c.strokeRect(300 - w / 2 - 11.5, PH - 57.5, w + 23, 29);
+  c.fillStyle = '#E8E4D8';
+  c.fillText(t, 300, PH - 42);
+}
+
+// --------------------------------------------------------------- screens ---
+
+function _drawTitle(c) {
+  var now = _now(), i;
+  c.fillStyle = '#05070A'; c.fillRect(0, 0, PW, PH + HH);
+  // slow ambient sonar rings from the centre
+  if (now - _titleLast > 1.7) { _titleLast = now; _titleRings.push({ t0: now }); }
+  for (i = _titleRings.length - 1; i >= 0; i--) {
+    var age = now - _titleRings[i].t0;
+    if (age > 4.5) { _titleRings.splice(i, 1); continue; }
+    var R = _easeOut(age / 3.5) * 430;
+    c.strokeStyle = 'rgba(191,239,255,' + ((1 - age / 4.5) * 0.22).toFixed(3) + ')';
+    c.lineWidth = Math.max(1, 4 * (1 - age / 4.5) + 1);
+    c.beginPath(); c.arc(300, 240, R, 0, Math.PI * 2); c.stroke();
+  }
+  c.textAlign = 'center'; c.textBaseline = 'middle';
+  c.font = 'bold 46px "Courier New", monospace'; c.fillStyle = '#E8E4D8';
+  _spacedJitter(c, 'ECHO CHAMBER', 300, 190, 10);
+  c.font = '16px "Courier New", monospace'; c.fillStyle = 'rgba(232,228,216,0.78)';
+  c.fillText('Every ping is a whisper. It is listening.', 300, 240);
+  c.globalAlpha = 0.55 + 0.45 * Math.sin(now * Math.PI);   // slow 0.5 Hz pulse
+  c.font = 'bold 18px "Courier New", monospace'; c.fillStyle = '#E8E4D8';
+  c.fillText('PRESS ENTER', 300, 312);
+  c.globalAlpha = 1;
+  c.font = '14px "Courier New", monospace'; c.fillStyle = 'rgba(232,228,216,0.62)';
+  c.fillText('WASD move \u00B7 SHIFT quiet \u00B7 SPACE sonar \u00B7 Q throw \u00B7 E radio', 300, 364);
+  c.fillText('Find 3 keycards. Reach the exit. Don\u2019t let it touch you.', 300, 388);
+  c.fillStyle = 'rgba(232,228,216,0.42)';
+  c.fillText('Contains flashing light effects.  M \u2014 mute.', 300, 448);
+}
+
+function _drawHowto(c) {
+  c.fillStyle = '#05070A'; c.fillRect(0, 0, PW, PH + HH);
+  c.textAlign = 'center'; c.textBaseline = 'middle';
+  c.font = 'bold 28px "Courier New", monospace'; c.fillStyle = '#E8E4D8';
+  _spaced(c, 'HOW TO PLAY', 300, 110, 8);
+  c.font = '16px "Courier New", monospace'; c.fillStyle = 'rgba(232,228,216,0.9)';
+  var lines = [
+    'WASD \u2014 move \u00B7 SHIFT \u2014 move quietly',
+    'SPACE \u2014 sonar pulse (reveals\u2026 but it hears)',
+    'Q \u2014 throw distraction \u00B7 E \u2014 drop radio',
+    'Find 3 keycards. Reach the exit. Don\u2019t let it touch you.'
+  ];
+  for (var i = 0; i < lines.length; i++) c.fillText(lines[i], 300, 185 + i * 36);
+  c.globalAlpha = 0.55 + 0.45 * Math.sin(_now() * Math.PI);
+  c.fillStyle = '#E8E4D8';
+  c.fillText('ENTER \u2014 begin', 300, 380);
+  c.globalAlpha = 1;
+}
+
+function _drawPause(c) {
+  c.fillStyle = 'rgba(5,7,10,0.78)'; c.fillRect(0, 0, PW, PH);
+  c.textAlign = 'center'; c.textBaseline = 'middle';
+  c.font = 'bold 34px "Courier New", monospace'; c.fillStyle = '#E8E4D8';
+  _spaced(c, 'PAUSED', 300, 200, 8);
+  c.font = '16px "Courier New", monospace'; c.fillStyle = 'rgba(232,228,216,0.75)';
+  c.fillText('Esc \u2014 resume', 300, 252);
+}
+
+function _drawWin(c) {
+  var el = _now() - _screenT0, i;
+  // slow amber flood — the single warm image in a cold game (1.5s ramp)
+  var fa = Math.min(0.5, el / 1.5 * 0.5);
+  c.fillStyle = 'rgba(245,165,36,' + fa.toFixed(3) + ')';
+  c.fillRect(0, 0, PW, PH);
+  c.fillStyle = 'rgba(5,7,10,0.82)'; c.fillRect(90, 108, 420, 284);
+  c.strokeStyle = 'rgba(245,165,36,0.6)'; c.lineWidth = 2;
+  c.strokeRect(90.5, 108.5, 419, 283);
+  c.textAlign = 'center'; c.textBaseline = 'middle';
+  c.font = 'bold 46px "Courier New", monospace'; c.fillStyle = '#E8E4D8';
+  _spaced(c, 'ESCAPED', 300, 168, 10);
+  var tstr = Math.floor(G.time / 60) + ':' + String(Math.floor(G.time % 60)).padStart(2, '0');
+  c.font = '16px "Courier New", monospace'; c.fillStyle = '#E8E4D8';
+  var stats = [
+    'TIME ' + tstr,
+    'PULSES ' + G.pulsesUsed,
+    'DISTRACTIONS ' + (G.throwsUsed + G.radiosUsed),
+    'SPOTTED ' + G.timesSpotted
+  ];
+  for (i = 0; i < stats.length; i++) c.fillText(stats[i], 300, 224 + i * 28);
+  c.globalAlpha = 0.6 + 0.4 * Math.sin(_now() * 2.4);
+  c.fillStyle = '#F5A524';
+  c.fillText('R \u2014 play again', 300, 354);
+  c.globalAlpha = 1;
+}
+
+function _epitaph() {
+  var r = G.loseReason || '';
+  if (/pulse/i.test(r)) return 'It heard your pulse.';
+  if (/saw|seen|spott|move/i.test(r)) return 'It saw you move.';
+  if (/path|walk|into/i.test(r)) return 'You walked into its path.';
+  if (r.length > 2 && r.length < 80) return r;
+  return 'It found you in the dark.';
+}
+
+function _drawLose(c) {
+  var el = _now() - _screenT0, i;
+  c.fillStyle = '#05070A'; c.fillRect(0, 0, PW, PH + HH);
+  // ember eyes: flash large for ~0.4s, then fade out slowly
+  var flash = Math.max(0, 1 - el / 0.4);
+  var fade = Math.max(0.06, 1 - el / 4);
+  var r = 3 + 9 * flash;
+  c.fillStyle = 'rgba(255,42,26,' + (0.30 * fade).toFixed(3) + ')';
+  c.beginPath(); c.arc(300 - 26, 195, r + 5, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(300 + 26, 195, r + 5, 0, Math.PI * 2); c.fill();
+  c.fillStyle = 'rgba(255,42,26,' + fade.toFixed(3) + ')';
+  c.beginPath(); c.arc(300 - 26, 195, r, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(300 + 26, 195, r, 0, Math.PI * 2); c.fill();
+  c.textAlign = 'center'; c.textBaseline = 'middle';
+  c.font = 'bold 40px "Courier New", monospace'; c.fillStyle = '#E8E4D8';
+  _spaced(c, 'TAKEN', 300, 278, 10);
+  c.font = '17px "Courier New", monospace'; c.fillStyle = 'rgba(232,228,216,0.85)';
+  var lines = _wrapLines(c, _epitaph(), 480);
+  for (i = 0; i < lines.length; i++) c.fillText(lines[i], 300, 328 + i * 24);
+  c.globalAlpha = 0.6 + 0.4 * Math.sin(_now() * 2.4);
+  c.font = '16px "Courier New", monospace'; c.fillStyle = '#E8E4D8';
+  c.fillText('R \u2014 try again (keycards kept)', 300, 392);
+  c.globalAlpha = 1;
+}
+
+// ----------------------------------------------------------------- render ---
+
+function render() {
+  _init();
+  var c = _cx;
+  var st = G.state;
+  if (st !== _screenSeen) {          // screen-transition bookkeeping (UI-local only)
+    _screenSeen = st;
+    _screenT0 = _now();
+    _keysSeen = -1;
+  }
+  if (st === 'TITLE') { _drawTitle(c); return; }
+  if (st === 'HOWTO') { _drawHowto(c); return; }
+
+  // 1. lit scene -> 2. fog mask -> composite
+  _drawLit(_litx);
+  _drawDark();
+  c.drawImage(_lit, 0, 0);
+  c.drawImage(_dark, 0, 0);
+  // 3. vignette (pre-rendered) -> 4. film grain (tiled, random offset)
+  c.drawImage(_vig, 0, 0);
+  _drawGrain(c);
+  // 5. proximity feedback (edge throb, chevrons, exit arrow)
+  _drawProximity(c);
+
+  if (st === 'PLAY' || st === 'PAUSE') {
+    // 6. HUD
+    _drawHUD(c);
+    _drawDread(c);
+    if (st === 'PLAY') _drawTutorial(c);
+    else _drawPause(c);
+  } else if (st === 'WIN') {
+    _drawWin(c);
+  } else if (st === 'LOSE') {
+    _drawLose(c);
+  }
+}
+
+
+/* ================= audio.js ================= */
+// Echo Chamber — audio + tutorial (component 4 of 4)
+// Plain script: uses shared globals C and G (read-only), declares Sfx and Tut.
+// 100% WebAudio-synthesized SFX, zero audio files. All audio is defensive:
+// if AudioContext is unavailable, every method no-ops silently.
+
+const Sfx = {
+  _ctx: null,
+  _master: null,
+  _muted: false,
+  _noiseBuf: null,
+  _droneGain: null,
+  _growlGain: null,
+  _radioGain: null,
+  _nextBeat: 0,
+  _huntFlag: false,
+
+  // Lazy init on first user gesture. Safe to call repeatedly.
+  init() {
+    if (this._ctx) return;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      const ctx = new AC();
+      this._ctx = ctx;
+      this._master = ctx.createGain();
+      this._master.gain.value = this._muted ? 0 : 0.2;
+      this._master.connect(ctx.destination);
+
+      // Shared 1 s white-noise buffer (reused by every noise sound).
+      const len = ctx.sampleRate;
+      const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+      const d = buf.getChannelData(0);
+      for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+      this._noiseBuf = buf;
+
+      // Ambient drone: 2 detuned sines (55 + 55.7 Hz) -> lowpass 200 Hz.
+      // Always on at low gain, created once and reused.
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.frequency.value = 200;
+      this._droneGain = ctx.createGain();
+      this._droneGain.gain.value = 0.035;
+      lp.connect(this._droneGain);
+      this._droneGain.connect(this._master);
+      const droneFreqs = [55, 55.7];
+      for (let i = 0; i < droneFreqs.length; i++) {
+        const o = ctx.createOscillator();
+        o.type = 'sine';
+        o.frequency.value = droneFreqs[i];
+        o.connect(lp);
+        o.start();
+      }
+
+      // Growl: sawtooth 65 Hz with a 3 Hz LFO on frequency (+-15 Hz)
+      // -> lowpass 300 Hz. Gain is driven per frame from proximity.
+      const gOsc = ctx.createOscillator();
+      gOsc.type = 'sawtooth';
+      gOsc.frequency.value = 65;
+      const gLfo = ctx.createOscillator();
+      gLfo.type = 'sine';
+      gLfo.frequency.value = 3;
+      const gLfoAmp = ctx.createGain();
+      gLfoAmp.gain.value = 15;
+      gLfo.connect(gLfoAmp);
+      gLfoAmp.connect(gOsc.frequency);
+      const gLp = ctx.createBiquadFilter();
+      gLp.type = 'lowpass';
+      gLp.frequency.value = 300;
+      this._growlGain = ctx.createGain();
+      this._growlGain.gain.value = 0;
+      gOsc.connect(gLp);
+      gLp.connect(this._growlGain);
+      this._growlGain.connect(this._master);
+      gOsc.start();
+      gLfo.start();
+
+      // Radio static: looped noise -> bandpass 3 kHz. Kept running;
+      // _radioGain (driven per frame) gates it on/off.
+      const rSrc = ctx.createBufferSource();
+      rSrc.buffer = buf;
+      rSrc.loop = true;
+      const rBp = ctx.createBiquadFilter();
+      rBp.type = 'bandpass';
+      rBp.frequency.value = 3000;
+      rBp.Q.value = 0.8;
+      this._radioGain = ctx.createGain();
+      this._radioGain.gain.value = 0;
+      rSrc.connect(rBp);
+      rBp.connect(this._radioGain);
+      this._radioGain.connect(this._master);
+      rSrc.start();
+    } catch (e) { /* AudioContext unavailable — all methods no-op */ }
+  },
+
+  toggleMute() {
+    this._muted = !this._muted;
+    try {
+      if (this._ctx && this._master) {
+        this._master.gain.setTargetAtTime(this._muted ? 0 : 0.2, this._ctx.currentTime, 0.02);
+      }
+    } catch (e) {}
+  },
+
+  // --- helpers -----------------------------------------------------------
+  // Envelope-shaped oscillator blip.
+  // o: {f0, f1, dur, type, vol, delay, att}
+  _tone(o) {
+    const ctx = this._ctx;
+    if (!ctx) return;
+    try {
+      const t = ctx.currentTime + (o.delay || 0);
+      const att = o.att != null ? o.att : 0.015;
+      const osc = ctx.createOscillator();
+      osc.type = o.type || 'sine';
+      osc.frequency.setValueAtTime(Math.max(o.f0, 1), t);
+      if (o.f1 && o.f1 !== o.f0) {
+        osc.frequency.exponentialRampToValueAtTime(Math.max(o.f1, 1), t + o.dur);
+      }
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(Math.max(o.vol || 0.15, 0.0001), t + att);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + o.dur);
+      osc.connect(g);
+      g.connect(this._master);
+      osc.start(t);
+      osc.stop(t + o.dur + 0.05);
+    } catch (e) {}
+  },
+
+  // Filtered noise burst from the shared buffer.
+  // o: {dur, fType, freq, Q, vol, delay}
+  _noise(o) {
+    const ctx = this._ctx;
+    if (!ctx || !this._noiseBuf) return;
+    try {
+      const t = ctx.currentTime + (o.delay || 0);
+      const src = ctx.createBufferSource();
+      src.buffer = this._noiseBuf;
+      src.loop = true;
+      const f = ctx.createBiquadFilter();
+      f.type = o.fType || 'lowpass';
+      f.frequency.value = o.freq || 1000;
+      if (o.Q) f.Q.value = o.Q;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(Math.max(o.vol || 0.12, 0.0001), t + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + o.dur);
+      src.connect(f);
+      f.connect(g);
+      g.connect(this._master);
+      src.start(t);
+      src.stop(t + o.dur + 0.05);
+    } catch (e) {}
+  },
+
+  // One heartbeat thump (55 Hz sine), scheduled at +delay seconds.
+  _thump(vol, delay) {
+    this._tone({ f0: 55, dur: 0.14, vol: vol, delay: delay });
+  },
+
+  // --- one-shot SFX ------------------------------------------------------
+  // Sonar ping: sine 880->440 Hz sweep (0.6 s) + bandpass noise whoosh.
+  ping() {
+    this._tone({ f0: 880, f1: 440, dur: 0.6, type: 'sine', vol: 0.18 });
+    this._noise({ dur: 0.4, fType: 'bandpass', freq: 1200, Q: 1, vol: 0.08 });
+  },
+
+  // Footstep: 60 ms lowpassed noise burst.
+  // quiet: gain 0.05 / lowpass 400 Hz (duller); else gain 0.12.
+  step(quiet) {
+    if (quiet) {
+      this._noise({ dur: 0.06, fType: 'lowpass', freq: 400, vol: 0.05 });
+    } else {
+      this._noise({ dur: 0.06, fType: 'lowpass', freq: 1200, vol: 0.12 });
+    }
+  },
+
+  // Keycard pickup: soft 660->990 Hz sine chime, 0.3 s.
+  pickup() {
+    this._tone({ f0: 660, f1: 990, dur: 0.3, type: 'sine', vol: 0.16 });
+  },
+
+  // Distraction throw clatter: 4 short square blips, random 800-2000 Hz.
+  clatter() {
+    for (let i = 0; i < 4; i++) {
+      this._tone({
+        f0: 800 + Math.random() * 1200,
+        dur: 0.05,
+        type: 'square',
+        vol: 0.12,
+        delay: i * 0.062
+      });
+    }
+  },
+
+  // Invalid throw: dull 180 Hz thud, 0.1 s.
+  bonk() {
+    this._tone({ f0: 180, dur: 0.1, type: 'sine', vol: 0.25 });
+  },
+
+  // Radio drop: short static burst.
+  radioDrop() {
+    this._noise({ dur: 0.15, fType: 'highpass', freq: 2000, vol: 0.12 });
+  },
+
+  // Exit unlock: warm 132 Hz + 198 Hz (fifth) sines, gentle.
+  unlock() {
+    this._tone({ f0: 132, dur: 1.2, type: 'sine', vol: 0.12, att: 0.2 });
+    this._tone({ f0: 198, dur: 1.2, type: 'sine', vol: 0.12, att: 0.2 });
+  },
+
+  // Creature chitter (it heard something): 5 x 40 ms bandpass-noise
+  // bursts at ~2 kHz, accelerating.
+  chitter() {
+    const gaps = [0, 0.07, 0.125, 0.165, 0.195];
+    for (let i = 0; i < gaps.length; i++) {
+      this._noise({ dur: 0.04, fType: 'bandpass', freq: 2000, Q: 8, vol: 0.18, delay: gaps[i] });
+    }
+  },
+
+  // Hunting sting: dissonant minor 2nd (220 + 233 Hz saws), 0.8 s swell.
+  // Plays once per lock-on; flag resets when the creature leaves HUNT.
+  huntSting() {
+    if (this._huntFlag) return;
+    this._huntFlag = true;
+    this._tone({ f0: 220, dur: 0.8, type: 'sawtooth', vol: 0.22, att: 0.3 });
+    this._tone({ f0: 233, dur: 0.8, type: 'sawtooth', vol: 0.22, att: 0.3 });
+  },
+
+  // Capture sting: 110 + 116.5 Hz saws at full gain for 1 s + noise crash.
+  capture() {
+    this._tone({ f0: 110, dur: 1.0, type: 'sawtooth', vol: 0.5, att: 0.01 });
+    this._tone({ f0: 116.5, dur: 1.0, type: 'sawtooth', vol: 0.5, att: 0.01 });
+    this._noise({ dur: 0.7, fType: 'lowpass', freq: 3000, vol: 0.4 });
+  },
+
+  // Win: soft major arpeggio (261 -> 329 -> 392 Hz sines), 1.2 s.
+  win() {
+    const notes = [261.63, 329.63, 392.0];
+    for (let i = 0; i < notes.length; i++) {
+      this._tone({ f0: notes[i], dur: 0.45, type: 'sine', vol: 0.18, delay: i * 0.35 });
+    }
+  },
+
+  // --- per-frame audio ---------------------------------------------------
+  // Called every frame in PLAY. Reuses long-lived nodes; never spawns
+  // oscillators per frame (heartbeat thumps are short envelope blips).
+  frame(dt) {
+    const ctx = this._ctx;
+    if (!ctx) return;
+    try {
+      const t = ctx.currentTime;
+
+      // Outside PLAY: silence proximity layers, keep the drone alive.
+      if (G.state !== 'PLAY') {
+        if (this._growlGain) this._growlGain.gain.setTargetAtTime(0, t, 0.2);
+        if (this._radioGain) this._radioGain.gain.setTargetAtTime(0, t, 0.2);
+        if (this._droneGain) this._droneGain.gain.setTargetAtTime(0.035, t, 0.3);
+        return;
+      }
+
+      const p = G.player;
+      const c = G.creature;
+      const dx = p.fx - c.x;
+      const dy = p.fy - c.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+
+      // Hunt-sting guard resets when the creature leaves HUNT.
+      if (c.cstate !== 'HUNT') this._huntFlag = false;
+
+      // Drone duck: slightly quieter when the creature is close (< 6 tiles).
+      if (this._droneGain) {
+        this._droneGain.gain.setTargetAtTime(dist < 6 ? 0.018 : 0.035, t, 0.25);
+      }
+
+      // Heartbeat: 40 -> 120 BPM mapped from distance 10 -> 3 tiles,
+      // gain 0 -> 0.5. Only when the creature is within 10 tiles.
+      if (dist < 10) {
+        const k = Math.min(1, Math.max(0, (10 - dist) / 7));
+        const bpm = 40 + 80 * k;
+        const vol = 0.5 * k;
+        if (t >= this._nextBeat) {
+          this._thump(vol, 0);          // lub
+          this._thump(vol * 0.8, 0.28); // dub
+          this._nextBeat = t + 60 / bpm;
+        }
+      } else {
+        this._nextBeat = t;
+      }
+
+      // Growl: gain scales with proximity (< 8 tiles).
+      if (this._growlGain) {
+        const g = dist < 8 ? 0.16 * (1 - dist / 8) : 0;
+        this._growlGain.gain.setTargetAtTime(g, t, 0.15);
+      }
+
+      // Radio static loop: audible while any radio is active.
+      if (this._radioGain) {
+        const rg = (G.radios && G.radios.length > 0) ? 0.08 : 0;
+        this._radioGain.gain.setTargetAtTime(rg, t, 0.1);
+      }
+    } catch (e) {}
+  }
+};
+
+const Tut = {
+  // step: 0..2 = beats 1..3 waiting on their action;
+  //       3 = beat 4 waiting on trigger, 4 = beat 4 showing (4 s);
+  //       5 = beat 5 waiting on G.time > 25, 6 = beat 5 showing (5 s);
+  //       7 = finished (text() is null forever, until reset).
+  step: 0,
+  _t: 0,
+
+  reset() {
+    this.step = 0;
+    this._t = 0;
+  },
+
+  update(dt) {
+    if (G.state !== 'PLAY') return;
+    switch (this.step) {
+      case 0: // beat 1: first player move
+        if (G.player.moving) this.step = 1;
+        break;
+      case 1: // beat 2: first sonar pulse
+        if (G.pulsesUsed > 0) this.step = 2;
+        break;
+      case 2: // beat 3: first keycard
+        if (G.keys > 0) this.step = 3;
+        break;
+      case 3: { // beat 4: creature hears the player (susp >= 40 / INVESTIGATE / HUNT)
+        const c = G.creature;
+        if (c.susp >= C.SUSP_INVESTIGATE ||
+            c.cstate === 'INVESTIGATE' ||
+            c.cstate === 'HUNT') {
+          this.step = 4;
+          this._t = 4;
+        }
+        break;
+      }
+      case 4: // beat 4 showing, 4 s
+        this._t -= dt;
+        if (this._t <= 0) this.step = 5;
+        break;
+      case 5: // beat 5: late-game tip
+        if (G.time > 25) {
+          this.step = 6;
+          this._t = 5;
+        }
+        break;
+      case 6: // beat 5 showing, 5 s
+        this._t -= dt;
+        if (this._t <= 0) this.step = 7;
+        break;
+      default:
+        break;
+    }
+  },
+
+  text() {
+    switch (this.step) {
+      case 0:
+        return "MOVE — WASD / arrows";
+      case 1:
+        return "PULSE — SPACE (it reveals… but it hears)";
+      case 2:
+        return "KEYCARD " + G.keys + "/3 — find them all, then reach the exit";
+      case 4:
+        return "IT HEARD THAT — hold SHIFT to move quietly";
+      case 6:
+        return "Q — throw to lure it · E — drop a radio";
+      default:
+        return null;
+    }
+  }
+};
+
+</script>
+</body>
+</html>
